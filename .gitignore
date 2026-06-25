@@ -1,0 +1,7 @@
+# Built artifacts — produced by install.sh / make-dmg.sh, attached as releases
+*.dmg
+AppIcon.iconset/
+*.icns
+
+# macOS noise
+.DS_Store
