@@ -101,6 +101,11 @@ struct ClaudeProc {
     let cwd: String?
     let command: String
     let label: String       // friendly menu label
+    let cpu: Double         // %CPU as reported by `ps` (decaying ~1min avg)
+    /// True when the process is currently consuming meaningful CPU — used to
+    /// spin the overlay gear. 5% covers "model is generating / tool running"
+    /// while staying above background idle of a few percent.
+    var isActive: Bool { cpu > 5.0 }
     var shortKind: String { // short tag used in the floating overlay
         switch label {
         case "Claude CLI":             return "cli"
@@ -196,22 +201,28 @@ func cwdsForPIDs(_ pids: [Int]) -> [Int: String] {
 }
 
 func listClaudeProcesses() -> [ClaudeProc] {
-    let out = runCapturingStdout("/bin/ps", ["-axww", "-o", "pid=,command="])
+    // pid, %cpu, command — ps prints these space-separated; split with
+    // maxSplits=2 so the command keeps its internal spaces intact.
+    let out = runCapturingStdout("/bin/ps", ["-axww", "-o", "pid=,pcpu=,command="])
     let myPID = Int(ProcessInfo.processInfo.processIdentifier)
-    var matched: [(Int, String, String)] = []  // pid, cmd, label
+    var matched: [(Int, String, String, Double)] = []  // pid, cmd, label, cpu
     for raw in out.split(separator: "\n") {
         let line = String(raw).trimmingCharacters(in: .whitespaces)
-        guard let sep = line.firstIndex(of: " ") else { continue }
-        let pidStr = String(line[..<sep])
-        guard let pid = Int(pidStr), pid != myPID else { continue }
-        let cmd = String(line[line.index(after: sep)...]).trimmingCharacters(in: .whitespaces)
+        let parts = line.split(separator: " ", maxSplits: 2,
+                               omittingEmptySubsequences: true)
+        guard parts.count >= 3,
+              let pid = Int(parts[0]),
+              let cpu = Double(parts[1]),
+              pid != myPID else { continue }
+        let cmd = String(parts[2]).trimmingCharacters(in: .whitespaces)
         if let label = classifyClaudeProcess(cmd) {
-            matched.append((pid, cmd, label))
+            matched.append((pid, cmd, label, cpu))
         }
     }
     let cwds = cwdsForPIDs(matched.map { $0.0 })
     return matched
-        .map { ClaudeProc(pid: $0.0, cwd: cwds[$0.0], command: $0.1, label: $0.2) }
+        .map { ClaudeProc(pid: $0.0, cwd: cwds[$0.0], command: $0.1,
+                          label: $0.2, cpu: $0.3) }
         .sorted { ($0.label, $0.pid) < ($1.label, $1.pid) }
 }
 
@@ -416,28 +427,74 @@ func makeGearIcon(diameter d: CGFloat) -> NSImage {
     return img
 }
 
-final class ProcessItemView: NSView {
+/// Clickable view that hosts the gear icon in a sublayer so we can attach a
+/// rotation animation independently of the surrounding NSView geometry.
+final class GearView: NSView {
+    private let imageLayer = CALayer()
+    private var spinning = false
     private let onClick: () -> Void
-    init(proc: ClaudeProc, width: CGFloat, onClick: @escaping () -> Void) {
+
+    init(diameter d: CGFloat, onClick: @escaping () -> Void) {
         self.onClick = onClick
+        super.init(frame: NSRect(x: 0, y: 0, width: d, height: d))
+        wantsLayer = true
+
+        imageLayer.frame = bounds
+        imageLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        imageLayer.position    = CGPoint(x: bounds.midX, y: bounds.midY)
+        imageLayer.contentsGravity = .resizeAspect
+        imageLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let gear = makeGearIcon(diameter: d)
+        var pr = NSRect(origin: .zero, size: gear.size)
+        if let cg = gear.cgImage(forProposedRect: &pr, context: nil, hints: nil) {
+            imageLayer.contents = cg
+        } else {
+            imageLayer.contents = gear
+        }
+        layer?.addSublayer(imageLayer)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) { onClick() }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .pointingHand) }
+
+    func setSpinning(_ active: Bool) {
+        if active == spinning { return }
+        spinning = active
+        if active {
+            let r = CABasicAnimation(keyPath: "transform.rotation.z")
+            r.fromValue = 0
+            r.toValue   = -CGFloat.pi * 2   // negative → clockwise on screen
+            r.duration  = 1.6
+            r.repeatCount = .infinity
+            r.isRemovedOnCompletion = false
+            imageLayer.add(r, forKey: "spin")
+        } else {
+            imageLayer.removeAnimation(forKey: "spin")
+        }
+    }
+}
+
+final class ProcessItemView: NSView {
+    let pid: Int
+    private let gear: GearView
+
+    init(proc: ClaudeProc, width: CGFloat, onClick: @escaping () -> Void) {
+        self.pid = proc.pid
         let iconSize: CGFloat = 38
         let labelGap: CGFloat = 4
         let labelHeight: CGFloat = 16
+        self.gear = GearView(diameter: iconSize, onClick: onClick)
+
         super.init(frame: NSRect(x: 0, y: 0, width: width,
                                  height: iconSize + labelGap + labelHeight))
         wantsLayer = true
 
-        let btn = NSButton(frame: NSRect(
-            x: (width - iconSize) / 2, y: labelGap + labelHeight,
-            width: iconSize, height: iconSize))
-        btn.bezelStyle = .regularSquare
-        btn.isBordered = false
-        btn.image = makeGearIcon(diameter: iconSize)
-        btn.imageScaling = .scaleProportionallyDown
-        btn.target = self
-        btn.action = #selector(handleClick)
-        btn.toolTip = "\(proc.label) — PID \(proc.pid)"
-        addSubview(btn)
+        gear.frame = NSRect(x: (width - iconSize) / 2,
+                            y: labelGap + labelHeight,
+                            width: iconSize, height: iconSize)
+        gear.toolTip = "\(proc.label) — PID \(proc.pid)"
+        addSubview(gear)
 
         let label = NSTextField(labelWithString: proc.shortKind)
         label.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
@@ -455,13 +512,18 @@ final class ProcessItemView: NSView {
             x: (width - lblW) / 2, y: 0,
             width: lblW, height: labelHeight)
         addSubview(label)
+
+        setActive(proc.isActive)
     }
     required init?(coder: NSCoder) { fatalError() }
-    @objc private func handleClick() { onClick() }
+    func setActive(_ a: Bool) { gear.setSpinning(a) }
 }
 
 final class OverlayController {
     private var window: NSWindow?
+    private var container: NSView?
+    private var itemsByPID: [Int: ProcessItemView] = [:]
+    private var lastFrameSize: NSSize = .zero
     private weak var delegate: AppDelegate?
     private let itemWidth: CGFloat = 84
     private let itemSpacing: CGFloat = 10
@@ -470,6 +532,10 @@ final class OverlayController {
 
     init(delegate: AppDelegate) { self.delegate = delegate }
 
+    /// Diff-based update: existing item views are reused (so the spin
+    /// animation isn't restarted on every refresh); we only build a new
+    /// view when a PID first appears, and only recreate the container when
+    /// the overall frame size changes.
     func update(procs: [ClaudeProc], cfg: Config) {
         let visibleProcs = Array(procs.prefix(maxItems))
         if !cfg.overlayEnabled || visibleProcs.isEmpty {
@@ -482,23 +548,19 @@ final class OverlayController {
         let screen = screens[screenIdx]
         let visible = screen.visibleFrame
 
-        // Compute frame
         let itemH: CGFloat = 38 + 4 + 16
         let totalH = CGFloat(visibleProcs.count) * itemH
                    + CGFloat(max(0, visibleProcs.count - 1)) * itemSpacing
                    + padding * 2
         let totalW = itemWidth + padding * 2
         let margin: CGFloat = 14
-        let x: CGFloat
-        if cfg.overlayCorner == "topLeft" {
-            x = visible.minX + margin
-        } else {
-            x = visible.maxX - totalW - margin
-        }
+        let x: CGFloat = (cfg.overlayCorner == "topLeft")
+            ? visible.minX + margin
+            : visible.maxX - totalW - margin
         let y = visible.maxY - totalH - margin
         let frame = NSRect(x: x, y: y, width: totalW, height: totalH)
 
-        // Reuse or create window
+        // Ensure window exists
         let w: NSWindow
         if let existing = window {
             w = existing
@@ -510,32 +572,55 @@ final class OverlayController {
             w.backgroundColor = .clear
             w.isOpaque = false
             w.hasShadow = false
-            w.ignoresMouseEvents = false  // we want clicks on the buttons
+            w.ignoresMouseEvents = false
             w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
             window = w
         }
         w.setFrame(frame, display: false)
 
-        // Build stacked content
-        let container = NSView(frame: NSRect(origin: .zero, size: frame.size))
-        container.wantsLayer = true
-        // Semi-transparent dark backdrop so labels read on any wallpaper
-        container.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
-        container.layer?.cornerRadius = 10
-        container.layer?.masksToBounds = true
+        // Ensure container; rebuild it (and start fresh) if the geometry changed
+        let frameSize = frame.size
+        let geometryChanged = (lastFrameSize != frameSize)
+        let needsNewContainer = container == nil || geometryChanged
+        if needsNewContainer {
+            let c = NSView(frame: NSRect(origin: .zero, size: frameSize))
+            c.wantsLayer = true
+            c.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
+            c.layer?.cornerRadius = 10
+            c.layer?.masksToBounds = true
+            // Re-attach existing items to the new container
+            for view in itemsByPID.values { c.addSubview(view) }
+            container = c
+            w.contentView = c
+            lastFrameSize = frameSize
+        }
+        guard let cont = container else { return }
 
+        // Diff PIDs
+        let newPIDs = Set(visibleProcs.map { $0.pid })
+        for (pid, view) in itemsByPID where !newPIDs.contains(pid) {
+            view.removeFromSuperview()
+            itemsByPID.removeValue(forKey: pid)
+        }
+
+        // Update existing + create new, then position
         var yOff = totalH - padding - itemH
         for p in visibleProcs {
-            let pidCopy = p
-            let item = ProcessItemView(proc: p, width: itemWidth) { [weak self] in
-                self?.delegate?.focusProcess(pidCopy)
+            let item: ProcessItemView
+            if let existing = itemsByPID[p.pid] {
+                item = existing
+                item.setActive(p.isActive)
+            } else {
+                let pidCopy = p.pid
+                item = ProcessItemView(proc: p, width: itemWidth) { [weak self] in
+                    self?.delegate?.focusPID(pidCopy)
+                }
+                cont.addSubview(item)
+                itemsByPID[p.pid] = item
             }
-            item.frame = NSRect(x: padding, y: yOff,
-                                width: itemWidth, height: item.frame.height)
-            container.addSubview(item)
+            item.setFrameOrigin(NSPoint(x: padding, y: yOff))
             yOff -= (itemH + itemSpacing)
         }
-        w.contentView = container
         w.orderFrontRegardless()
     }
 
@@ -543,6 +628,9 @@ final class OverlayController {
         window?.orderOut(nil)
         window?.close()
         window = nil
+        container = nil
+        itemsByPID.removeAll()
+        lastFrameSize = .zero
     }
 }
 
@@ -915,10 +1003,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    func focusProcess(_ proc: ClaudeProc) {
+    func focusProcess(_ proc: ClaudeProc) { focusPID(proc.pid) }
+
+    func focusPID(_ pid: Int) {
         // Background-walk so a slow `ps` doesn't freeze the click feedback.
         procQueue.async {
-            let target = autoreleasepool { findGUIAncestorApp(forPID: proc.pid) }
+            let target = autoreleasepool { findGUIAncestorApp(forPID: pid) }
             DispatchQueue.main.async {
                 target?.activate(options: [.activateAllWindows])
             }
