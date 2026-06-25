@@ -975,18 +975,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let menu = statusItem?.menu { populateMenu(menu) }
     }
 
-    /// Idempotently registers ClaudeSound's Notification/Stop hooks in
-    /// ~/.claude/settings.json. Each hook captures the bash subprocess's
-    /// $PPID (= the Claude session process) so the receiving app can
-    /// associate events with a specific running session.
-    /// On upgrade from older versions the older command-format is detected
-    /// and replaced; other user-configured hooks are preserved.
+    /// Idempotently registers ClaudeSound's hooks in ~/.claude/settings.json.
+    /// Each hook captures the bash subprocess's $PPID (= the Claude session
+    /// process) so the receiving app can associate events with a specific
+    /// running session. Older formats are migrated; other user hooks stay.
     private func ensureClaudeHooksInstalled() {
         let settingsURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/settings.json")
         let triggerPath = TRIGGER_URL.path
-        let notifyCmd = "echo \"notify $PPID\" >> \"\(triggerPath)\""
-        let doneCmd   = "echo \"done $PPID\" >> \"\(triggerPath)\""
+
+        // Each ClaudeSound hook keeps a stable shape so we can compare exactly.
+        let wanted: [(event: String, cmd: String)] = [
+            ("Notification",      "echo \"notify $PPID\" >> \"\(triggerPath)\""),
+            ("Stop",              "echo \"done $PPID\" >> \"\(triggerPath)\""),
+            ("UserPromptSubmit",  "echo \"answered $PPID\" >> \"\(triggerPath)\""),
+        ]
 
         try? FileManager.default.createDirectory(at: APP_SUPPORT,
                                                  withIntermediateDirectories: true)
@@ -1006,11 +1009,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             return false
         }
-        if hasExact(in: "Notification", cmd: notifyCmd) &&
-           hasExact(in: "Stop",         cmd: doneCmd) { return }
+        if wanted.allSatisfy({ hasExact(in: $0.event, cmd: $0.cmd) }) { return }
 
-        // Strip out any previous incarnation of our hooks (matched by trigger
-        // path) so we don't accumulate duplicates across version upgrades.
+        // Strip any previous version of our hooks (anything pointing at our
+        // trigger file) so duplicates don't pile up across upgrades.
         func purge(_ eventName: String) -> [[String: Any]] {
             let list = (hooks[eventName] as? [[String: Any]]) ?? []
             return list.filter { entry in
@@ -1020,16 +1022,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
-
-        var notifyList = purge("Notification")
-        notifyList.append(["matcher": "",
-                           "hooks": [["type": "command", "command": notifyCmd]]])
-        hooks["Notification"] = notifyList
-
-        var doneList = purge("Stop")
-        doneList.append(["matcher": "",
-                         "hooks": [["type": "command", "command": doneCmd]]])
-        hooks["Stop"] = doneList
+        for (event, cmd) in wanted {
+            var list = purge(event)
+            list.append(["matcher": "",
+                         "hooks": [["type": "command", "command": cmd]]])
+            hooks[event] = list
+        }
 
         settings["hooks"] = hooks
         try? FileManager.default.createDirectory(
@@ -1409,10 +1407,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func testNotify() { handleEvent("notify") }
 
     private func handleEvent(_ event: String) {
-        // Event lines look like "notify 12345" or "done 12345" — the PID is
-        // captured from the hook's shell via $PPID and identifies the asking
-        // Claude session. Older hook formats without a PID still work for
-        // sound/popup; only the per-session badge is unavailable then.
+        // Event lines: "notify 12345" / "done 12345" / "answered 12345". The
+        // PID is captured from the hook's shell via $PPID and identifies the
+        // session. Older hook formats without a PID still work for the
+        // sound/popup; only the per-session badge needs a PID.
         let parts = event.split(separator: " ", maxSplits: 1)
         let kind = String(parts.first ?? "")
         let pid: Int? = (parts.count >= 2) ? Int(parts[1]) : nil
@@ -1425,9 +1423,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 askingPIDs.insert(pid)
                 refreshOverlay()
             }
+        case "answered":
+            // User has replied — Claude no longer waits, so badge should clear
+            // even before the next Stop.
+            if let pid = pid {
+                askingPIDs.remove(pid)
+                refreshOverlay()
+            }
         case "done":
             playSound(cfg.doneSound)
             if cfg.visualEffect { visual.show() }
+            // Stop also clears the badge as a safety net in case
+            // UserPromptSubmit was missed (e.g. via slash-command or restart).
             if let pid = pid {
                 askingPIDs.remove(pid)
                 refreshOverlay()

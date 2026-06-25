@@ -36,8 +36,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>ClaudeSound</string>
   <key>CFBundleDisplayName</key><string>ClaudeSound</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleVersion</key><string>1.3</string>
-  <key>CFBundleShortVersionString</key><string>1.3</string>
+  <key>CFBundleVersion</key><string>1.4</string>
+  <key>CFBundleShortVersionString</key><string>1.4</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSUIElement</key><true/>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
@@ -78,11 +78,13 @@ import json, sys, pathlib
 settings_path = pathlib.Path(sys.argv[1])
 trigger = sys.argv[2]
 data = json.loads(settings_path.read_text() or "{}")
-notify_cmd = 'echo "notify $PPID" >> ' + json.dumps(trigger)
-done_cmd   = 'echo "done $PPID" >> '   + json.dumps(trigger)
+notify_cmd   = 'echo "notify $PPID" >> '   + json.dumps(trigger)
+done_cmd     = 'echo "done $PPID" >> '     + json.dumps(trigger)
+answered_cmd = 'echo "answered $PPID" >> ' + json.dumps(trigger)
 data.setdefault("hooks", {})
-data["hooks"]["Notification"] = [{"matcher": "", "hooks": [{"type": "command", "command": notify_cmd}]}]
-data["hooks"]["Stop"]         = [{"matcher": "", "hooks": [{"type": "command", "command": done_cmd}]}]
+data["hooks"]["Notification"]     = [{"matcher": "", "hooks": [{"type": "command", "command": notify_cmd}]}]
+data["hooks"]["Stop"]             = [{"matcher": "", "hooks": [{"type": "command", "command": done_cmd}]}]
+data["hooks"]["UserPromptSubmit"] = [{"matcher": "", "hooks": [{"type": "command", "command": answered_cmd}]}]
 settings_path.write_text(json.dumps(data, indent=2) + "\n")
 PY
 
