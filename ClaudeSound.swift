@@ -427,11 +427,38 @@ func makeGearIcon(diameter d: CGFloat) -> NSImage {
     return img
 }
 
+func makeExclamationBadge(diameter d: CGFloat) -> NSImage {
+    let img = NSImage(size: NSSize(width: d, height: d))
+    img.lockFocus()
+    // Red filled circle with subtle white outline for contrast
+    NSColor.white.setStroke()
+    NSColor.systemRed.setFill()
+    let outer = NSBezierPath(ovalIn: NSRect(x: 0.5, y: 0.5, width: d - 1, height: d - 1))
+    outer.fill()
+    outer.lineWidth = 1.0
+    outer.stroke()
+    // White "!" centered
+    let attrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.systemFont(ofSize: d * 0.72, weight: .heavy),
+        .foregroundColor: NSColor.white,
+    ]
+    let str = NSAttributedString(string: "!", attributes: attrs)
+    let sz = str.size()
+    str.draw(at: NSPoint(x: (d - sz.width) / 2,
+                         y: (d - sz.height) / 2 - d * 0.04))
+    img.unlockFocus()
+    return img
+}
+
 /// Clickable view that hosts the gear icon in a sublayer so we can attach a
 /// rotation animation independently of the surrounding NSView geometry.
+/// A second sublayer shows a red "!" badge in the top-right when the
+/// matching Claude session is asking the user a question.
 final class GearView: NSView {
     private let imageLayer = CALayer()
+    private let badgeLayer = CALayer()
     private var spinning = false
+    private var asking   = false
     private let onClick: () -> Void
 
     init(diameter d: CGFloat, onClick: @escaping () -> Void) {
@@ -452,6 +479,24 @@ final class GearView: NSView {
             imageLayer.contents = gear
         }
         layer?.addSublayer(imageLayer)
+
+        // "!" badge — pinned to the top-right corner of the gear, sits on top
+        // of the rotating layer so it doesn't spin with the gear.
+        let badgeD: CGFloat = d * 0.48
+        badgeLayer.frame = NSRect(x: bounds.maxX - badgeD,
+                                  y: bounds.maxY - badgeD,
+                                  width: badgeD, height: badgeD)
+        badgeLayer.contentsGravity = .resizeAspect
+        badgeLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let badge = makeExclamationBadge(diameter: badgeD)
+        var br = NSRect(origin: .zero, size: badge.size)
+        if let cg = badge.cgImage(forProposedRect: &br, context: nil, hints: nil) {
+            badgeLayer.contents = cg
+        } else {
+            badgeLayer.contents = badge
+        }
+        badgeLayer.isHidden = true
+        layer?.addSublayer(badgeLayer)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -472,6 +517,12 @@ final class GearView: NSView {
         } else {
             imageLayer.removeAnimation(forKey: "spin")
         }
+    }
+
+    func setAsking(_ a: Bool) {
+        if a == asking { return }
+        asking = a
+        badgeLayer.isHidden = !a
     }
 }
 
@@ -517,6 +568,7 @@ final class ProcessItemView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
     func setActive(_ a: Bool) { gear.setSpinning(a) }
+    func setAsking(_ a: Bool) { gear.setAsking(a) }
 }
 
 final class OverlayController {
@@ -536,7 +588,7 @@ final class OverlayController {
     /// animation isn't restarted on every refresh); we only build a new
     /// view when a PID first appears, and only recreate the container when
     /// the overall frame size changes.
-    func update(procs: [ClaudeProc], cfg: Config) {
+    func update(procs: [ClaudeProc], cfg: Config, asking: Set<Int> = []) {
         let visibleProcs = Array(procs.prefix(maxItems))
         if !cfg.overlayEnabled || visibleProcs.isEmpty {
             close()
@@ -607,14 +659,17 @@ final class OverlayController {
         var yOff = totalH - padding - itemH
         for p in visibleProcs {
             let item: ProcessItemView
+            let isAsking = asking.contains(p.pid)
             if let existing = itemsByPID[p.pid] {
                 item = existing
                 item.setActive(p.isActive)
+                item.setAsking(isAsking)
             } else {
                 let pidCopy = p.pid
                 item = ProcessItemView(proc: p, width: itemWidth) { [weak self] in
                     self?.delegate?.focusPID(pidCopy)
                 }
+                item.setAsking(isAsking)
                 cont.addSubview(item)
                 itemsByPID[p.pid] = item
             }
@@ -768,6 +823,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private lazy var overlay = OverlayController(delegate: self)
     private var overlayTimer: Timer?
+    // PIDs of Claude sessions currently waiting on the user (Notification
+    // fired, no Stop yet). Stored as Int so we can serialize event-line PIDs.
+    private var askingPIDs: Set<Int> = []
 
     private var updateState: UpdateState = .idle
     private var updateTimer: Timer?
@@ -918,13 +976,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     /// Idempotently registers ClaudeSound's Notification/Stop hooks in
-    /// ~/.claude/settings.json so a freshly-DMG'd install works without the
-    /// user running any setup script. Leaves any other hooks the user has
-    /// configured untouched.
+    /// ~/.claude/settings.json. Each hook captures the bash subprocess's
+    /// $PPID (= the Claude session process) so the receiving app can
+    /// associate events with a specific running session.
+    /// On upgrade from older versions the older command-format is detected
+    /// and replaced; other user-configured hooks are preserved.
     private func ensureClaudeHooksInstalled() {
         let settingsURL = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".claude/settings.json")
         let triggerPath = TRIGGER_URL.path
+        let notifyCmd = "echo \"notify $PPID\" >> \"\(triggerPath)\""
+        let doneCmd   = "echo \"done $PPID\" >> \"\(triggerPath)\""
 
         try? FileManager.default.createDirectory(at: APP_SUPPORT,
                                                  withIntermediateDirectories: true)
@@ -936,39 +998,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
 
-        func hasOurHook(in eventName: String) -> Bool {
+        func hasExact(in eventName: String, cmd: String) -> Bool {
             guard let list = hooks[eventName] as? [[String: Any]] else { return false }
             for entry in list {
                 guard let inner = entry["hooks"] as? [[String: Any]] else { continue }
-                for hk in inner {
-                    if let cmd = hk["command"] as? String, cmd.contains(triggerPath) {
-                        return true
-                    }
-                }
+                for hk in inner where (hk["command"] as? String) == cmd { return true }
             }
             return false
         }
+        if hasExact(in: "Notification", cmd: notifyCmd) &&
+           hasExact(in: "Stop",         cmd: doneCmd) { return }
 
-        let alreadyOK = hasOurHook(in: "Notification") && hasOurHook(in: "Stop")
-        if alreadyOK { return }
+        // Strip out any previous incarnation of our hooks (matched by trigger
+        // path) so we don't accumulate duplicates across version upgrades.
+        func purge(_ eventName: String) -> [[String: Any]] {
+            let list = (hooks[eventName] as? [[String: Any]]) ?? []
+            return list.filter { entry in
+                guard let inner = entry["hooks"] as? [[String: Any]] else { return true }
+                return !inner.contains {
+                    ($0["command"] as? String)?.contains(triggerPath) == true
+                }
+            }
+        }
 
-        func appendHook(_ eventName: String, command: String) {
-            var list = hooks[eventName] as? [[String: Any]] ?? []
-            list.append([
-                "matcher": "",
-                "hooks":   [["type": "command", "command": command]]
-            ])
-            hooks[eventName] = list
-        }
-        let q = "\""
-        if !hasOurHook(in: "Notification") {
-            appendHook("Notification", command: "echo notify >> \(q)\(triggerPath)\(q)")
-        }
-        if !hasOurHook(in: "Stop") {
-            appendHook("Stop", command: "echo done >> \(q)\(triggerPath)\(q)")
-        }
+        var notifyList = purge("Notification")
+        notifyList.append(["matcher": "",
+                           "hooks": [["type": "command", "command": notifyCmd]]])
+        hooks["Notification"] = notifyList
+
+        var doneList = purge("Stop")
+        doneList.append(["matcher": "",
+                         "hooks": [["type": "command", "command": doneCmd]]])
+        hooks["Stop"] = doneList
+
         settings["hooks"] = hooks
-
         try? FileManager.default.createDirectory(
             at: settingsURL.deletingLastPathComponent(),
             withIntermediateDirectories: true)
@@ -989,9 +1052,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.cachedProcs = procs
                 self.procsLoaded = true
                 self.refreshing = false
-                self.overlay.update(procs: procs, cfg: ConfigStore.current)
+                // Drop "asking" flags for sessions that no longer exist
+                let live = Set(procs.map { $0.pid })
+                self.askingPIDs = self.askingPIDs.intersection(live)
+                self.refreshOverlay()
             }
         }
+    }
+
+    /// Single point that pushes the current overlay state. Use this rather
+    /// than calling overlay.update directly so askingPIDs is always passed in.
+    private func refreshOverlay() {
+        overlay.update(procs: cachedProcs,
+                       cfg: ConfigStore.current,
+                       asking: askingPIDs)
     }
 
     private func startOverlayTimer() {
@@ -1307,14 +1381,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let idx = sender.representedObject as? Int else { return }
         ConfigStore.current.overlayScreenIndex = idx
         ConfigStore.save()
-        overlay.update(procs: cachedProcs, cfg: ConfigStore.current)
+        refreshOverlay()
     }
 
     @objc private func pickCorner(_ sender: NSMenuItem) {
         guard let key = sender.representedObject as? String else { return }
         ConfigStore.current.overlayCorner = key
         ConfigStore.save()
-        overlay.update(procs: cachedProcs, cfg: ConfigStore.current)
+        refreshOverlay()
     }
 
     @objc private func pickDoneSound(_ sender: NSMenuItem) {
@@ -1335,14 +1409,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func testNotify() { handleEvent("notify") }
 
     private func handleEvent(_ event: String) {
+        // Event lines look like "notify 12345" or "done 12345" — the PID is
+        // captured from the hook's shell via $PPID and identifies the asking
+        // Claude session. Older hook formats without a PID still work for
+        // sound/popup; only the per-session badge is unavailable then.
+        let parts = event.split(separator: " ", maxSplits: 1)
+        let kind = String(parts.first ?? "")
+        let pid: Int? = (parts.count >= 2) ? Int(parts[1]) : nil
         let cfg = ConfigStore.current
-        switch event {
+        switch kind {
         case "notify":
             playSound(cfg.notifySound)
             if cfg.visualEffect { visual.show() }
+            if let pid = pid {
+                askingPIDs.insert(pid)
+                refreshOverlay()
+            }
         case "done":
             playSound(cfg.doneSound)
             if cfg.visualEffect { visual.show() }
+            if let pid = pid {
+                askingPIDs.remove(pid)
+                refreshOverlay()
+            }
         default: break
         }
     }
