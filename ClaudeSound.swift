@@ -417,38 +417,11 @@ func makeGearIcon(diameter d: CGFloat) -> NSImage {
     return img
 }
 
-func makeExclamationBadge(diameter d: CGFloat) -> NSImage {
-    let img = NSImage(size: NSSize(width: d, height: d))
-    img.lockFocus()
-    // Red filled circle with subtle white outline for contrast
-    NSColor.white.setStroke()
-    NSColor.systemRed.setFill()
-    let outer = NSBezierPath(ovalIn: NSRect(x: 0.5, y: 0.5, width: d - 1, height: d - 1))
-    outer.fill()
-    outer.lineWidth = 1.0
-    outer.stroke()
-    // White "!" centered
-    let attrs: [NSAttributedString.Key: Any] = [
-        .font: NSFont.systemFont(ofSize: d * 0.72, weight: .heavy),
-        .foregroundColor: NSColor.white,
-    ]
-    let str = NSAttributedString(string: "!", attributes: attrs)
-    let sz = str.size()
-    str.draw(at: NSPoint(x: (d - sz.width) / 2,
-                         y: (d - sz.height) / 2 - d * 0.04))
-    img.unlockFocus()
-    return img
-}
-
 /// Clickable view that hosts the gear icon in a sublayer so we can attach a
 /// rotation animation independently of the surrounding NSView geometry.
-/// A second sublayer shows a red "!" badge in the top-right when the
-/// matching Claude session is asking the user a question.
 final class GearView: NSView {
     private let imageLayer = CALayer()
-    private let badgeLayer = CALayer()
     private var spinning = false
-    private var asking   = false
     private let onClick: () -> Void
 
     init(diameter d: CGFloat, onClick: @escaping () -> Void) {
@@ -469,24 +442,6 @@ final class GearView: NSView {
             imageLayer.contents = gear
         }
         layer?.addSublayer(imageLayer)
-
-        // "!" badge — pinned to the top-right corner of the gear, sits on top
-        // of the rotating layer so it doesn't spin with the gear.
-        let badgeD: CGFloat = d * 0.48
-        badgeLayer.frame = NSRect(x: bounds.maxX - badgeD,
-                                  y: bounds.maxY - badgeD,
-                                  width: badgeD, height: badgeD)
-        badgeLayer.contentsGravity = .resizeAspect
-        badgeLayer.contentsScale = NSScreen.main?.backingScaleFactor ?? 2.0
-        let badge = makeExclamationBadge(diameter: badgeD)
-        var br = NSRect(origin: .zero, size: badge.size)
-        if let cg = badge.cgImage(forProposedRect: &br, context: nil, hints: nil) {
-            badgeLayer.contents = cg
-        } else {
-            badgeLayer.contents = badge
-        }
-        badgeLayer.isHidden = true
-        layer?.addSublayer(badgeLayer)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -507,12 +462,6 @@ final class GearView: NSView {
         } else {
             imageLayer.removeAnimation(forKey: "spin")
         }
-    }
-
-    func setAsking(_ a: Bool) {
-        if a == asking { return }
-        asking = a
-        badgeLayer.isHidden = !a
     }
 }
 
@@ -556,7 +505,6 @@ final class ProcessItemView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
     func setActive(_ a: Bool) { gear.setSpinning(a) }
-    func setAsking(_ a: Bool) { gear.setAsking(a) }
 }
 
 final class OverlayController {
@@ -576,8 +524,7 @@ final class OverlayController {
     /// animation isn't restarted on every refresh); we only build a new
     /// view when a PID first appears, and only recreate the container when
     /// the overall frame size changes.
-    func update(procs: [ClaudeProc], cfg: Config,
-                active: Set<Int> = [], asking: Set<Int> = []) {
+    func update(procs: [ClaudeProc], cfg: Config, active: Set<Int> = []) {
         let visibleProcs = Array(procs.prefix(maxItems))
         if !cfg.overlayEnabled || visibleProcs.isEmpty {
             close()
@@ -649,18 +596,15 @@ final class OverlayController {
         for p in visibleProcs {
             let item: ProcessItemView
             let isActive = active.contains(p.pid)
-            let isAsking = asking.contains(p.pid)
             if let existing = itemsByPID[p.pid] {
                 item = existing
                 item.setActive(isActive)
-                item.setAsking(isAsking)
             } else {
                 let pidCopy = p.pid
                 item = ProcessItemView(proc: p, width: itemWidth) { [weak self] in
                     self?.delegate?.focusPID(pidCopy)
                 }
                 item.setActive(isActive)
-                item.setAsking(isAsking)
                 cont.addSubview(item)
                 itemsByPID[p.pid] = item
             }
@@ -814,9 +758,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private lazy var overlay = OverlayController(delegate: self)
     private var overlayTimer: Timer?
-    // PIDs of Claude sessions currently waiting on the user (Notification
-    // fired, no Stop yet).
-    private var askingPIDs: Set<Int> = []
     // PIDs currently doing work (UserPromptSubmit fired, no Stop yet).
     // Hook-derived rather than CPU-derived — accurate even when the local
     // process is mostly waiting on the model server.
@@ -1047,7 +988,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.refreshing = false
                 // Drop state for sessions that no longer exist
                 let live = Set(procs.map { $0.pid })
-                self.askingPIDs  = self.askingPIDs.intersection(live)
                 self.workingPIDs = self.workingPIDs.intersection(live)
                 self.refreshOverlay()
             }
@@ -1058,8 +998,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func refreshOverlay() {
         overlay.update(procs: cachedProcs,
                        cfg: ConfigStore.current,
-                       active: workingPIDs,
-                       asking: askingPIDs)
+                       active: workingPIDs)
     }
 
     private func startOverlayTimer() {
@@ -1403,11 +1342,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func testNotify() { handleEvent("notify") }
 
     private func handleEvent(_ event: String) {
-        // Event lines: "notify 12345" / "answered 12345" / "done 12345". PID
-        // comes from the hook's shell $PPID. The state machine:
-        //   notify   → asking on, working stays on
-        //   answered → asking off, working on
-        //   done     → asking off, working off
+        // Event lines: "notify 12345" / "answered 12345" / "done 12345".
+        // PID comes from the hook's shell $PPID. `answered` (UserPromptSubmit)
+        // toggles working on; `done` (Stop) toggles it off.
         let parts = event.split(separator: " ", maxSplits: 1)
         let kind = String(parts.first ?? "")
         let pid: Int? = (parts.count >= 2) ? Int(parts[1]) : nil
@@ -1416,14 +1353,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case "notify":
             playSound(cfg.notifySound)
             if cfg.visualEffect { visual.show() }
-            if let pid = pid {
-                askingPIDs.insert(pid)
-                refreshOverlay()
-            }
         case "answered":
-            // User submitted a prompt — Claude starts working, badge clears.
             if let pid = pid {
-                askingPIDs.remove(pid)
                 workingPIDs.insert(pid)
                 refreshOverlay()
             }
@@ -1431,7 +1362,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             playSound(cfg.doneSound)
             if cfg.visualEffect { visual.show() }
             if let pid = pid {
-                askingPIDs.remove(pid)
                 workingPIDs.remove(pid)
                 refreshOverlay()
             }

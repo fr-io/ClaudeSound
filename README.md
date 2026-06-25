@@ -14,7 +14,6 @@ Kleine macOS-Menüleisten-App rund um [Claude Code](https://docs.claude.com/en/d
 - Pro laufender Claude-Sitzung ein schwebendes Zahnrad mit Kurzlabel (`agent` / `cli` / `code` / `desktop`)
 - Bildschirm und Ecke (oben links / oben rechts) frei wählbar
 - **Zahnrad dreht sich**, solange die Sitzung gerade arbeitet (zwischen `UserPromptSubmit` und `Stop`)
-- **Rotes „!"-Badge**, sobald Claude eine Rückfrage stellt — bleibt liegen bis du antwortest
 - Klick auf ein Zahnrad fokussiert das zugehörige Fenster (Terminal-Session, Claude.app, …) — geht über die Parent-PID-Kette bis zur nächsten GUI-App
 
 **Selbst-Updater**
@@ -85,13 +84,13 @@ Die App registriert beim ersten Start (idempotent, additiv):
 `$PPID` ist die PID des aufrufenden Claude-Prozesses — so weiß die App, *welche* Sitzung gerade etwas tut. Die App watcht `trigger.log` per `DispatchSource` und reagiert auf neue Zeilen. Beim Upgrade von älteren Versionen werden Hooks mit veraltetem Command-Format automatisch ersetzt.
 
 State-Machine pro Session-PID:
-| Event | Asking | Working |
+| Event | Sound | Working |
 |---|---|---|
-| `notify` (Notification) | **on** | unverändert |
-| `answered` (UserPromptSubmit) | off | **on** |
-| `done` (Stop) | off | off |
+| `notify` (Notification) | „Rückfrage" | unverändert |
+| `answered` (UserPromptSubmit) | — | **on** |
+| `done` (Stop) | „fertig" | off |
 
-→ `Asking` rendert das „!"-Badge. `Working` rotiert das Zahnrad.
+→ `Working` rotiert das Zahnrad.
 
 ## Dateien
 
