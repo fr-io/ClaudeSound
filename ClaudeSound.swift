@@ -101,11 +101,6 @@ struct ClaudeProc {
     let cwd: String?
     let command: String
     let label: String       // friendly menu label
-    let cpu: Double         // %CPU as reported by `ps` (decaying ~1min avg)
-    /// True when the process is currently consuming meaningful CPU — used to
-    /// spin the overlay gear. 5% covers "model is generating / tool running"
-    /// while staying above background idle of a few percent.
-    var isActive: Bool { cpu > 5.0 }
     var shortKind: String { // short tag used in the floating overlay
         switch label {
         case "Claude CLI":             return "cli"
@@ -201,28 +196,23 @@ func cwdsForPIDs(_ pids: [Int]) -> [Int: String] {
 }
 
 func listClaudeProcesses() -> [ClaudeProc] {
-    // pid, %cpu, command — ps prints these space-separated; split with
-    // maxSplits=2 so the command keeps its internal spaces intact.
-    let out = runCapturingStdout("/bin/ps", ["-axww", "-o", "pid=,pcpu=,command="])
+    let out = runCapturingStdout("/bin/ps", ["-axww", "-o", "pid=,command="])
     let myPID = Int(ProcessInfo.processInfo.processIdentifier)
-    var matched: [(Int, String, String, Double)] = []  // pid, cmd, label, cpu
+    var matched: [(Int, String, String)] = []  // pid, cmd, label
     for raw in out.split(separator: "\n") {
         let line = String(raw).trimmingCharacters(in: .whitespaces)
-        let parts = line.split(separator: " ", maxSplits: 2,
-                               omittingEmptySubsequences: true)
-        guard parts.count >= 3,
-              let pid = Int(parts[0]),
-              let cpu = Double(parts[1]),
-              pid != myPID else { continue }
-        let cmd = String(parts[2]).trimmingCharacters(in: .whitespaces)
+        guard let sep = line.firstIndex(of: " ") else { continue }
+        let pidStr = String(line[..<sep])
+        guard let pid = Int(pidStr), pid != myPID else { continue }
+        let cmd = String(line[line.index(after: sep)...])
+            .trimmingCharacters(in: .whitespaces)
         if let label = classifyClaudeProcess(cmd) {
-            matched.append((pid, cmd, label, cpu))
+            matched.append((pid, cmd, label))
         }
     }
     let cwds = cwdsForPIDs(matched.map { $0.0 })
     return matched
-        .map { ClaudeProc(pid: $0.0, cwd: cwds[$0.0], command: $0.1,
-                          label: $0.2, cpu: $0.3) }
+        .map { ClaudeProc(pid: $0.0, cwd: cwds[$0.0], command: $0.1, label: $0.2) }
         .sorted { ($0.label, $0.pid) < ($1.label, $1.pid) }
 }
 
@@ -563,8 +553,6 @@ final class ProcessItemView: NSView {
             x: (width - lblW) / 2, y: 0,
             width: lblW, height: labelHeight)
         addSubview(label)
-
-        setActive(proc.isActive)
     }
     required init?(coder: NSCoder) { fatalError() }
     func setActive(_ a: Bool) { gear.setSpinning(a) }
@@ -588,7 +576,8 @@ final class OverlayController {
     /// animation isn't restarted on every refresh); we only build a new
     /// view when a PID first appears, and only recreate the container when
     /// the overall frame size changes.
-    func update(procs: [ClaudeProc], cfg: Config, asking: Set<Int> = []) {
+    func update(procs: [ClaudeProc], cfg: Config,
+                active: Set<Int> = [], asking: Set<Int> = []) {
         let visibleProcs = Array(procs.prefix(maxItems))
         if !cfg.overlayEnabled || visibleProcs.isEmpty {
             close()
@@ -659,16 +648,18 @@ final class OverlayController {
         var yOff = totalH - padding - itemH
         for p in visibleProcs {
             let item: ProcessItemView
+            let isActive = active.contains(p.pid)
             let isAsking = asking.contains(p.pid)
             if let existing = itemsByPID[p.pid] {
                 item = existing
-                item.setActive(p.isActive)
+                item.setActive(isActive)
                 item.setAsking(isAsking)
             } else {
                 let pidCopy = p.pid
                 item = ProcessItemView(proc: p, width: itemWidth) { [weak self] in
                     self?.delegate?.focusPID(pidCopy)
                 }
+                item.setActive(isActive)
                 item.setAsking(isAsking)
                 cont.addSubview(item)
                 itemsByPID[p.pid] = item
@@ -824,8 +815,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var overlay = OverlayController(delegate: self)
     private var overlayTimer: Timer?
     // PIDs of Claude sessions currently waiting on the user (Notification
-    // fired, no Stop yet). Stored as Int so we can serialize event-line PIDs.
+    // fired, no Stop yet).
     private var askingPIDs: Set<Int> = []
+    // PIDs currently doing work (UserPromptSubmit fired, no Stop yet).
+    // Hook-derived rather than CPU-derived — accurate even when the local
+    // process is mostly waiting on the model server.
+    private var workingPIDs: Set<Int> = []
 
     private var updateState: UpdateState = .idle
     private var updateTimer: Timer?
@@ -1050,19 +1045,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.cachedProcs = procs
                 self.procsLoaded = true
                 self.refreshing = false
-                // Drop "asking" flags for sessions that no longer exist
+                // Drop state for sessions that no longer exist
                 let live = Set(procs.map { $0.pid })
-                self.askingPIDs = self.askingPIDs.intersection(live)
+                self.askingPIDs  = self.askingPIDs.intersection(live)
+                self.workingPIDs = self.workingPIDs.intersection(live)
                 self.refreshOverlay()
             }
         }
     }
 
-    /// Single point that pushes the current overlay state. Use this rather
-    /// than calling overlay.update directly so askingPIDs is always passed in.
+    /// Single point that pushes the current overlay state.
     private func refreshOverlay() {
         overlay.update(procs: cachedProcs,
                        cfg: ConfigStore.current,
+                       active: workingPIDs,
                        asking: askingPIDs)
     }
 
@@ -1407,10 +1403,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func testNotify() { handleEvent("notify") }
 
     private func handleEvent(_ event: String) {
-        // Event lines: "notify 12345" / "done 12345" / "answered 12345". The
-        // PID is captured from the hook's shell via $PPID and identifies the
-        // session. Older hook formats without a PID still work for the
-        // sound/popup; only the per-session badge needs a PID.
+        // Event lines: "notify 12345" / "answered 12345" / "done 12345". PID
+        // comes from the hook's shell $PPID. The state machine:
+        //   notify   → asking on, working stays on
+        //   answered → asking off, working on
+        //   done     → asking off, working off
         let parts = event.split(separator: " ", maxSplits: 1)
         let kind = String(parts.first ?? "")
         let pid: Int? = (parts.count >= 2) ? Int(parts[1]) : nil
@@ -1424,19 +1421,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 refreshOverlay()
             }
         case "answered":
-            // User has replied — Claude no longer waits, so badge should clear
-            // even before the next Stop.
+            // User submitted a prompt — Claude starts working, badge clears.
             if let pid = pid {
                 askingPIDs.remove(pid)
+                workingPIDs.insert(pid)
                 refreshOverlay()
             }
         case "done":
             playSound(cfg.doneSound)
             if cfg.visualEffect { visual.show() }
-            // Stop also clears the badge as a safety net in case
-            // UserPromptSubmit was missed (e.g. via slash-command or restart).
             if let pid = pid {
                 askingPIDs.remove(pid)
+                workingPIDs.remove(pid)
                 refreshOverlay()
             }
         default: break
