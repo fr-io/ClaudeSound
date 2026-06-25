@@ -6,7 +6,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="ClaudeSound"
 APP_DIR="$HOME/Applications/$APP_NAME.app"
-VERSION="1.0"
+VERSION="1.1"
 DMG_OUT="$SCRIPT_DIR/$APP_NAME-$VERSION.dmg"
 
 if [ ! -d "$APP_DIR" ]; then

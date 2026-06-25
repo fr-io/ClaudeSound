@@ -15,6 +15,9 @@ struct Config: Codable {
     var notifySound: String = "Funk"
     var doneSound:   String = "Glass"
     var visualEffect: Bool  = false
+    var overlayEnabled: Bool = false
+    var overlayScreenIndex: Int = 0      // index into NSScreen.screens
+    var overlayCorner: String = "topRight"   // "topRight" | "topLeft"
 }
 
 enum ConfigStore {
@@ -97,7 +100,36 @@ struct ClaudeProc {
     let pid: Int
     let cwd: String?
     let command: String
-    let label: String   // friendly menu label
+    let label: String       // friendly menu label
+    var shortKind: String { // short tag used in the floating overlay
+        switch label {
+        case "Claude CLI":             return "cli"
+        case "Claude Code":            return "code"
+        case "Claude Agent (Desktop)": return "agent"
+        case "Claude Desktop":         return "desktop"
+        default:                       return "claude"
+        }
+    }
+}
+
+/// Walks up the parent-PID chain until we hit a regular GUI app (Terminal,
+/// iTerm, Claude.app, VS Code, …). Returns nil if nothing GUI is found.
+func findGUIAncestorApp(forPID pid: Int) -> NSRunningApplication? {
+    var current = pid_t(pid)
+    for _ in 0..<16 {
+        if current <= 1 { break }
+        if let app = NSRunningApplication(processIdentifier: current),
+           app.activationPolicy == .regular {
+            return app
+        }
+        current = parentPID(of: current)
+    }
+    return nil
+}
+
+func parentPID(of pid: pid_t) -> pid_t {
+    let out = runCapturingStdout("/bin/ps", ["-p", "\(pid)", "-o", "ppid="])
+    return pid_t(out.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
 }
 
 func runCapturingStdout(_ launch: String, _ args: [String]) -> String {
@@ -342,6 +374,295 @@ final class TriggerWatcher {
     }
 }
 
+// MARK: - Floating session overlay
+
+func makeGearIcon(diameter d: CGFloat) -> NSImage {
+    let img = NSImage(size: NSSize(width: d, height: d))
+    img.lockFocus()
+
+    // White circle background for contrast against any wallpaper
+    NSColor.white.withAlphaComponent(0.94).setFill()
+    let bg = NSBezierPath(ovalIn: NSRect(x: 1, y: 1, width: d - 2, height: d - 2))
+    bg.fill()
+    NSColor.black.withAlphaComponent(0.18).setStroke()
+    bg.lineWidth = 0.7
+    bg.stroke()
+
+    // Hand-drawn gear: 8 teeth, dark grey
+    let center = NSPoint(x: d/2, y: d/2)
+    let outerR = d * 0.36
+    let baseR  = d * 0.26
+    let holeR  = d * 0.10
+    let teeth  = 8
+    let segs   = teeth * 2  // alternating outer/base
+    let path = NSBezierPath()
+    for i in 0..<segs {
+        let a = (Double(i) / Double(segs)) * .pi * 2 - .pi/2
+        let r = (i % 2 == 0) ? outerR : baseR
+        let dx = CGFloat(cos(a)), dy = CGFloat(sin(a))
+        let pt = NSPoint(x: center.x + dx * r, y: center.y + dy * r)
+        if i == 0 { path.move(to: pt) } else { path.line(to: pt) }
+    }
+    path.close()
+    NSColor(white: 0.22, alpha: 1.0).setFill()
+    path.fill()
+    // Center hole — fill with the same colour as the background to fake a cut-out
+    NSColor.white.withAlphaComponent(0.94).setFill()
+    NSBezierPath(ovalIn: NSRect(
+        x: center.x - holeR, y: center.y - holeR,
+        width: holeR*2, height: holeR*2)).fill()
+
+    img.unlockFocus()
+    return img
+}
+
+final class ProcessItemView: NSView {
+    private let onClick: () -> Void
+    init(proc: ClaudeProc, width: CGFloat, onClick: @escaping () -> Void) {
+        self.onClick = onClick
+        let iconSize: CGFloat = 38
+        let labelGap: CGFloat = 4
+        let labelHeight: CGFloat = 16
+        super.init(frame: NSRect(x: 0, y: 0, width: width,
+                                 height: iconSize + labelGap + labelHeight))
+        wantsLayer = true
+
+        let btn = NSButton(frame: NSRect(
+            x: (width - iconSize) / 2, y: labelGap + labelHeight,
+            width: iconSize, height: iconSize))
+        btn.bezelStyle = .regularSquare
+        btn.isBordered = false
+        btn.image = makeGearIcon(diameter: iconSize)
+        btn.imageScaling = .scaleProportionallyDown
+        btn.target = self
+        btn.action = #selector(handleClick)
+        btn.toolTip = "\(proc.label) — PID \(proc.pid)"
+        addSubview(btn)
+
+        let label = NSTextField(labelWithString: proc.shortKind)
+        label.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        label.alignment = .center
+        label.textColor = .white
+        label.backgroundColor = NSColor.black.withAlphaComponent(0.72)
+        label.drawsBackground = true
+        label.isBordered = false
+        label.wantsLayer = true
+        label.layer?.cornerRadius = 5
+        label.layer?.masksToBounds = true
+        let intrinsic = label.intrinsicContentSize
+        let lblW = min(intrinsic.width + 10, width)
+        label.frame = NSRect(
+            x: (width - lblW) / 2, y: 0,
+            width: lblW, height: labelHeight)
+        addSubview(label)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    @objc private func handleClick() { onClick() }
+}
+
+final class OverlayController {
+    private var window: NSWindow?
+    private weak var delegate: AppDelegate?
+    private let itemWidth: CGFloat = 84
+    private let itemSpacing: CGFloat = 10
+    private let padding: CGFloat = 10
+    private let maxItems = 8
+
+    init(delegate: AppDelegate) { self.delegate = delegate }
+
+    func update(procs: [ClaudeProc], cfg: Config) {
+        let visibleProcs = Array(procs.prefix(maxItems))
+        if !cfg.overlayEnabled || visibleProcs.isEmpty {
+            close()
+            return
+        }
+        let screens = NSScreen.screens
+        guard !screens.isEmpty else { close(); return }
+        let screenIdx = min(max(0, cfg.overlayScreenIndex), screens.count - 1)
+        let screen = screens[screenIdx]
+        let visible = screen.visibleFrame
+
+        // Compute frame
+        let itemH: CGFloat = 38 + 4 + 16
+        let totalH = CGFloat(visibleProcs.count) * itemH
+                   + CGFloat(max(0, visibleProcs.count - 1)) * itemSpacing
+                   + padding * 2
+        let totalW = itemWidth + padding * 2
+        let margin: CGFloat = 14
+        let x: CGFloat
+        if cfg.overlayCorner == "topLeft" {
+            x = visible.minX + margin
+        } else {
+            x = visible.maxX - totalW - margin
+        }
+        let y = visible.maxY - totalH - margin
+        let frame = NSRect(x: x, y: y, width: totalW, height: totalH)
+
+        // Reuse or create window
+        let w: NSWindow
+        if let existing = window {
+            w = existing
+        } else {
+            w = NSWindow(contentRect: frame, styleMask: .borderless,
+                         backing: .buffered, defer: false)
+            w.isReleasedWhenClosed = false
+            w.level = .statusBar
+            w.backgroundColor = .clear
+            w.isOpaque = false
+            w.hasShadow = false
+            w.ignoresMouseEvents = false  // we want clicks on the buttons
+            w.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+            window = w
+        }
+        w.setFrame(frame, display: false)
+
+        // Build stacked content
+        let container = NSView(frame: NSRect(origin: .zero, size: frame.size))
+        container.wantsLayer = true
+        // Semi-transparent dark backdrop so labels read on any wallpaper
+        container.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
+        container.layer?.cornerRadius = 10
+        container.layer?.masksToBounds = true
+
+        var yOff = totalH - padding - itemH
+        for p in visibleProcs {
+            let pidCopy = p
+            let item = ProcessItemView(proc: p, width: itemWidth) { [weak self] in
+                self?.delegate?.focusProcess(pidCopy)
+            }
+            item.frame = NSRect(x: padding, y: yOff,
+                                width: itemWidth, height: item.frame.height)
+            container.addSubview(item)
+            yOff -= (itemH + itemSpacing)
+        }
+        w.contentView = container
+        w.orderFrontRegardless()
+    }
+
+    func close() {
+        window?.orderOut(nil)
+        window?.close()
+        window = nil
+    }
+}
+
+// MARK: - Updater (self-update from GitHub releases)
+
+let UPDATE_REPO = "fr-io/ClaudeSound"
+
+struct GitHubRelease: Codable {
+    let tagName: String
+    let name: String?
+    let htmlUrl: String
+    let assets: [Asset]
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case name
+        case htmlUrl = "html_url"
+        case assets
+    }
+    struct Asset: Codable {
+        let name: String
+        let browserDownloadUrl: String
+        enum CodingKeys: String, CodingKey {
+            case name
+            case browserDownloadUrl = "browser_download_url"
+        }
+    }
+}
+
+enum UpdateState {
+    case idle
+    case checking
+    case available(version: String, dmgURL: URL)
+    case downloading
+    case applying
+    case error(String)
+}
+
+func currentAppVersion() -> String {
+    (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "0"
+}
+
+func versionTuple(_ s: String) -> [Int] {
+    s.trimmingCharacters(in: CharacterSet(charactersIn: "v "))
+     .split(separator: ".")
+     .compactMap { Int($0) }
+}
+
+func isVersion(_ remote: String, newerThan local: String) -> Bool {
+    let r = versionTuple(remote), l = versionTuple(local)
+    let n = max(r.count, l.count)
+    for i in 0..<n {
+        let a = i < r.count ? r[i] : 0
+        let b = i < l.count ? l[i] : 0
+        if a != b { return a > b }
+    }
+    return false
+}
+
+func fetchLatestRelease(completion: @escaping (Result<GitHubRelease, Error>) -> Void) {
+    guard let url = URL(string: "https://api.github.com/repos/\(UPDATE_REPO)/releases/latest") else {
+        completion(.failure(NSError(domain: "ClaudeSound", code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "invalid URL"])))
+        return
+    }
+    var req = URLRequest(url: url)
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    req.timeoutInterval = 10
+    URLSession.shared.dataTask(with: req) { data, _, err in
+        if let err = err { completion(.failure(err)); return }
+        guard let data = data else {
+            completion(.failure(NSError(domain: "ClaudeSound", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "no data"])))
+            return
+        }
+        do {
+            let dec = JSONDecoder()
+            let r = try dec.decode(GitHubRelease.self, from: data)
+            completion(.success(r))
+        } catch {
+            completion(.failure(error))
+        }
+    }.resume()
+}
+
+// Embedded updater shell script. Runs after our app quits, mounts the
+// downloaded DMG, swaps the bundle on disk, unmounts, and re-launches.
+let UPDATER_SCRIPT = #"""
+#!/bin/bash
+APP_PID="$1"
+DMG="$2"
+APP_DIR="$3"
+
+# Wait for the calling app to exit (max ~12 s)
+for i in $(seq 1 48); do
+  if ! kill -0 "$APP_PID" 2>/dev/null; then break; fi
+  sleep 0.25
+done
+
+MOUNT_OUTPUT=$(hdiutil attach -nobrowse -noverify "$DMG" 2>/dev/null)
+MOUNT_DIR=$(echo "$MOUNT_OUTPUT" | grep -oE '/Volumes/[^[:cntrl:]]+' | tail -1)
+NEW_APP="$MOUNT_DIR/ClaudeSound.app"
+
+if [ -n "$MOUNT_DIR" ] && [ -d "$NEW_APP" ]; then
+  rm -rf "$APP_DIR"
+  cp -R "$NEW_APP" "$APP_DIR"
+  xattr -cr "$APP_DIR" 2>/dev/null || true
+  hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true
+  open "$APP_DIR"
+else
+  [ -n "$MOUNT_DIR" ] && hdiutil detach "$MOUNT_DIR" -quiet 2>/dev/null || true
+  /usr/bin/osascript -e 'display alert "ClaudeSound Update fehlgeschlagen" message "Die neue Version konnte nicht installiert werden. Die alte Version bleibt funktionsfähig."'
+  open "$APP_DIR"
+fi
+rm -f "$DMG"
+"""#
+
+func shellQuote(_ s: String) -> String {
+    "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -357,6 +678,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let procQueue = DispatchQueue(
         label: "ch.flomeinigg.ClaudeSound.proc", qos: .userInitiated)
 
+    private lazy var overlay = OverlayController(delegate: self)
+    private var overlayTimer: Timer?
+
+    private var updateState: UpdateState = .idle
+    private var updateTimer: Timer?
+
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
@@ -370,11 +697,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshProcsAsync()
 
         ensureClaudeHooksInstalled()
+        startOverlayTimer()
+        scheduleUpdateChecks()
 
         watcher = TriggerWatcher(url: TRIGGER_URL) { [weak self] ev in
             self?.handleEvent(ev)
         }
         watcher.start()
+    }
+
+    // MARK: Update checking
+
+    private func scheduleUpdateChecks() {
+        // First check 5 s after launch (don't slow startup), then hourly.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            self?.checkForUpdates()
+        }
+        updateTimer?.invalidate()
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            self?.checkForUpdates()
+        }
+    }
+
+    @objc private func checkForUpdates() {
+        // Don't re-enter while a check / download is in flight.
+        switch updateState {
+        case .checking, .downloading, .applying: return
+        default: break
+        }
+        updateState = .checking
+        rebuildMenuIfPresent()
+        fetchLatestRelease { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .failure(let err):
+                    self.updateState = .error(err.localizedDescription)
+                case .success(let release):
+                    let local = currentAppVersion()
+                    if isVersion(release.tagName, newerThan: local),
+                       let asset = release.assets.first(where: { $0.name.hasSuffix(".dmg") }),
+                       let dmg = URL(string: asset.browserDownloadUrl) {
+                        let cleanVersion = release.tagName
+                            .trimmingCharacters(in: CharacterSet(charactersIn: "v "))
+                        self.updateState = .available(version: cleanVersion, dmgURL: dmg)
+                    } else {
+                        self.updateState = .idle
+                    }
+                }
+                self.rebuildMenuIfPresent()
+            }
+        }
+    }
+
+    @objc private func applyUpdate() {
+        guard case .available(_, let dmgURL) = updateState else { return }
+        updateState = .downloading
+        rebuildMenuIfPresent()
+
+        let tmpDMG = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("ClaudeSound-update-\(UUID().uuidString).dmg")
+
+        URLSession.shared.downloadTask(with: dmgURL) { [weak self] tmpURL, _, err in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if let err = err {
+                    self.updateState = .error("Download fehlgeschlagen: \(err.localizedDescription)")
+                    self.rebuildMenuIfPresent()
+                    return
+                }
+                guard let tmpURL = tmpURL else {
+                    self.updateState = .error("Kein Download-Ziel.")
+                    self.rebuildMenuIfPresent()
+                    return
+                }
+                do {
+                    try? FileManager.default.removeItem(at: tmpDMG)
+                    try FileManager.default.moveItem(at: tmpURL, to: tmpDMG)
+                } catch {
+                    self.updateState = .error("DMG konnte nicht abgelegt werden: \(error.localizedDescription)")
+                    self.rebuildMenuIfPresent()
+                    return
+                }
+                self.updateState = .applying
+                self.rebuildMenuIfPresent()
+                self.spawnUpdater(dmgPath: tmpDMG.path)
+            }
+        }.resume()
+    }
+
+    private func spawnUpdater(dmgPath: String) {
+        let scriptPath = NSTemporaryDirectory()
+            + "claudesound-updater-\(UUID().uuidString).sh"
+        do {
+            try UPDATER_SCRIPT.write(toFile: scriptPath, atomically: true, encoding: .utf8)
+            _ = chmod(scriptPath, 0o755)
+        } catch {
+            updateState = .error("Updater-Script: \(error.localizedDescription)")
+            rebuildMenuIfPresent()
+            return
+        }
+
+        let pid = ProcessInfo.processInfo.processIdentifier
+        let bundlePath = Bundle.main.bundlePath
+        let cmd = "nohup bash \(shellQuote(scriptPath)) "
+                + "\(shellQuote(String(pid))) "
+                + "\(shellQuote(dmgPath)) "
+                + "\(shellQuote(bundlePath)) "
+                + ">/dev/null 2>&1 & disown"
+
+        let p = Process()
+        p.launchPath = "/bin/bash"
+        p.arguments = ["-c", cmd]
+        do {
+            try p.run()
+            p.waitUntilExit()  // bash -c returns immediately after backgrounding
+        } catch {
+            updateState = .error("Updater-Start: \(error.localizedDescription)")
+            rebuildMenuIfPresent()
+            return
+        }
+
+        // Give the detached script a moment to spin up, then quit so it can
+        // swap the bundle on disk.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func rebuildMenuIfPresent() {
+        if let menu = statusItem?.menu { populateMenu(menu) }
     }
 
     /// Idempotently registers ClaudeSound's Notification/Stop hooks in
@@ -449,6 +901,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self.cachedProcs = procs
                 self.procsLoaded = true
                 self.refreshing = false
+                self.overlay.update(procs: procs, cfg: ConfigStore.current)
+            }
+        }
+    }
+
+    private func startOverlayTimer() {
+        overlayTimer?.invalidate()
+        overlayTimer = nil
+        guard ConfigStore.current.overlayEnabled else { return }
+        overlayTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { [weak self] _ in
+            self?.refreshProcsAsync()
+        }
+    }
+
+    func focusProcess(_ proc: ClaudeProc) {
+        // Background-walk so a slow `ps` doesn't freeze the click feedback.
+        procQueue.async {
+            let target = autoreleasepool { findGUIAncestorApp(forPID: proc.pid) }
+            DispatchQueue.main.async {
+                target?.activate(options: [.activateAllWindows])
             }
         }
     }
@@ -508,10 +980,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func populateMenu(_ m: NSMenu) {
         m.removeAllItems()
 
-        let header = NSMenuItem(title: "ClaudeSound", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "ClaudeSound v\(currentAppVersion())",
+                                action: nil, keyEquivalent: "")
         header.isEnabled = false
         m.addItem(header)
         m.addItem(.separator())
+
+        addUpdateSection(to: m)
 
         // Running Claude processes (uses cache; refreshed in background)
         let procs = cachedProcs
@@ -562,6 +1037,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         vfx.target = self
         m.addItem(vfx)
 
+        let ovr = NSMenuItem(title: "Sitzungs-Overlay (Zahnräder)",
+                             action: #selector(toggleOverlay), keyEquivalent: "")
+        ovr.state = ConfigStore.current.overlayEnabled ? .on : .off
+        ovr.target = self
+        m.addItem(ovr)
+
+        let screensItem = NSMenuItem(title: "Overlay-Bildschirm", action: nil, keyEquivalent: "")
+        screensItem.submenu = buildScreenSubmenu()
+        m.addItem(screensItem)
+
+        let cornerItem = NSMenuItem(title: "Overlay-Ecke", action: nil, keyEquivalent: "")
+        cornerItem.submenu = buildCornerSubmenu()
+        m.addItem(cornerItem)
+
         m.addItem(.separator())
         let sounds = availableSounds()
 
@@ -584,9 +1073,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tN.target = self; m.addItem(tN)
 
         m.addItem(.separator())
+        let checkUpd = NSMenuItem(title: "Nach Updates suchen",
+                                  action: #selector(checkForUpdates),
+                                  keyEquivalent: "")
+        checkUpd.target = self
+        m.addItem(checkUpd)
         m.addItem(NSMenuItem(title: "Beenden",
                              action: #selector(NSApplication.terminate(_:)),
                              keyEquivalent: "q"))
+    }
+
+    private func addUpdateSection(to m: NSMenu) {
+        switch updateState {
+        case .idle, .checking:
+            return  // nothing shown at top
+        case .available(let version, _):
+            let banner = NSMenuItem(
+                title: "🆙 Update verfügbar: v\(version)",
+                action: nil, keyEquivalent: "")
+            banner.isEnabled = false
+            let attr = NSMutableAttributedString(string: banner.title)
+            attr.addAttribute(.foregroundColor,
+                              value: NSColor.systemBlue,
+                              range: NSRange(location: 0, length: attr.length))
+            attr.addAttribute(.font,
+                              value: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
+                              range: NSRange(location: 0, length: attr.length))
+            banner.attributedTitle = attr
+            m.addItem(banner)
+
+            let apply = NSMenuItem(title: "    Jetzt aktualisieren",
+                                   action: #selector(applyUpdate),
+                                   keyEquivalent: "")
+            apply.target = self
+            m.addItem(apply)
+            m.addItem(.separator())
+        case .downloading:
+            let it = NSMenuItem(title: "⏬ Update wird geladen…",
+                                action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            m.addItem(it)
+            m.addItem(.separator())
+        case .applying:
+            let it = NSMenuItem(title: "🔄 Update wird angewendet — App startet neu…",
+                                action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            m.addItem(it)
+            m.addItem(.separator())
+        case .error(let msg):
+            let it = NSMenuItem(title: "⚠️ Update-Fehler",
+                                action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            it.toolTip = msg
+            m.addItem(it)
+            m.addItem(.separator())
+        }
     }
 
     private func soundSubmenu(sounds: [String], selected: String, action: Selector) -> NSMenu {
@@ -596,6 +1137,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             it.state = (s == selected) ? .on : .off
             it.target = self
             it.representedObject = s
+            sub.addItem(it)
+        }
+        return sub
+    }
+
+    private func buildScreenSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        let screens = NSScreen.screens
+        let selected = ConfigStore.current.overlayScreenIndex
+        for (i, screen) in screens.enumerated() {
+            let name = screen.localizedName.isEmpty
+                ? "Bildschirm \(i + 1)"
+                : "\(screen.localizedName) (#\(i + 1))"
+            let sizeStr = "\(Int(screen.frame.width))×\(Int(screen.frame.height))"
+            let it = NSMenuItem(title: "\(name) — \(sizeStr)",
+                                action: #selector(pickScreen(_:)), keyEquivalent: "")
+            it.state = (i == selected) ? .on : .off
+            it.target = self
+            it.representedObject = i
+            sub.addItem(it)
+        }
+        if screens.isEmpty {
+            let it = NSMenuItem(title: "(keine Bildschirme gefunden)",
+                                action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            sub.addItem(it)
+        }
+        return sub
+    }
+
+    private func buildCornerSubmenu() -> NSMenu {
+        let sub = NSMenu()
+        let current = ConfigStore.current.overlayCorner
+        for (title, key) in [("oben rechts", "topRight"), ("oben links", "topLeft")] {
+            let it = NSMenuItem(title: title,
+                                action: #selector(pickCorner(_:)), keyEquivalent: "")
+            it.state = (key == current) ? .on : .off
+            it.target = self
+            it.representedObject = key
             sub.addItem(it)
         }
         return sub
@@ -620,6 +1200,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ConfigStore.current.visualEffect.toggle()
         ConfigStore.save()
         if ConfigStore.current.visualEffect { visual.show() }
+    }
+
+    @objc private func toggleOverlay() {
+        ConfigStore.current.overlayEnabled.toggle()
+        ConfigStore.save()
+        startOverlayTimer()
+        if ConfigStore.current.overlayEnabled {
+            refreshProcsAsync()
+        } else {
+            overlay.close()
+        }
+    }
+
+    @objc private func pickScreen(_ sender: NSMenuItem) {
+        guard let idx = sender.representedObject as? Int else { return }
+        ConfigStore.current.overlayScreenIndex = idx
+        ConfigStore.save()
+        overlay.update(procs: cachedProcs, cfg: ConfigStore.current)
+    }
+
+    @objc private func pickCorner(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String else { return }
+        ConfigStore.current.overlayCorner = key
+        ConfigStore.save()
+        overlay.update(procs: cachedProcs, cfg: ConfigStore.current)
     }
 
     @objc private func pickDoneSound(_ sender: NSMenuItem) {
