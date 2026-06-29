@@ -9,6 +9,7 @@ Kleine macOS-Menüleisten-App rund um [Claude Code](https://docs.claude.com/en/d
 **Audio + visuelle Benachrichtigung**
 - Eigener Sound für „Rückfrage" und „fertig" — beliebige `*.aiff` aus `/System/Library/Sounds/`
 - Optionaler Claude-Logo-Popup oben rechts auf **allen** angeschlossenen Bildschirmen
+- Optionale **macOS-Banner-Notification** wenn eine Session fertig wird (mit Working-Directory im Body)
 
 **Sitzungs-Overlay**
 - Pro laufender Claude-Sitzung ein schwebendes Zahnrad mit Kurzlabel (`agent` / `cli` / `code` / `desktop`)

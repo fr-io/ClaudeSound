@@ -1,4 +1,5 @@
 import Cocoa
+import UserNotifications
 
 let APP_SUPPORT = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/ClaudeSound", isDirectory: true)
@@ -18,6 +19,7 @@ struct Config: Codable {
     var overlayEnabled: Bool = false
     var overlayScreenIndex: Int = 0      // index into NSScreen.screens
     var overlayCorner: String = "topRight"   // "topRight" | "topLeft"
+    var macNotification: Bool = false        // banner on `done`
 }
 
 enum ConfigStore {
@@ -741,9 +743,34 @@ func shellQuote(_ s: String) -> String {
     "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
+// MARK: - macOS notification helpers
+
+func requestMacNotificationPermission(_ completion: ((Bool) -> Void)? = nil) {
+    UNUserNotificationCenter.current().requestAuthorization(
+        options: [.alert, .sound]
+    ) { granted, _ in
+        DispatchQueue.main.async { completion?(granted) }
+    }
+}
+
+func postMacNotification(title: String, body: String?) {
+    let content = UNMutableNotificationContent()
+    content.title = title
+    if let body = body, !body.isEmpty { content.body = body }
+    // We already play the configured AIFF on `done`; don't double up.
+    content.sound = nil
+    let req = UNNotificationRequest(
+        identifier: UUID().uuidString,
+        content: content,
+        trigger: nil)
+    UNUserNotificationCenter.current().add(req) { err in
+        if let err = err { NSLog("ClaudeSound: notification post failed: \(err)") }
+    }
+}
+
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     var statusItem: NSStatusItem!
     let visual = VisualEffectController()
     var watcher: TriggerWatcher!
@@ -781,6 +808,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ensureClaudeHooksInstalled()
         startOverlayTimer()
         scheduleUpdateChecks()
+
+        UNUserNotificationCenter.current().delegate = self
+        if ConfigStore.current.macNotification {
+            // Idempotent — just refreshes the OS's view of our authorization.
+            requestMacNotificationPermission(nil)
+        }
 
         watcher = TriggerWatcher(url: TRIGGER_URL) { [weak self] ev in
             self?.handleEvent(ev)
@@ -1134,6 +1167,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         vfx.target = self
         m.addItem(vfx)
 
+        let macNotif = NSMenuItem(title: "Mac-Benachrichtigung wenn fertig",
+                                  action: #selector(toggleMacNotification),
+                                  keyEquivalent: "")
+        macNotif.state = ConfigStore.current.macNotification ? .on : .off
+        macNotif.target = self
+        m.addItem(macNotif)
+
         let ovr = NSMenuItem(title: "Sitzungs-Overlay (Zahnräder)",
                              action: #selector(toggleOverlay), keyEquivalent: "")
         ovr.state = ConfigStore.current.overlayEnabled ? .on : .off
@@ -1299,6 +1339,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if ConfigStore.current.visualEffect { visual.show() }
     }
 
+    @objc private func toggleMacNotification() {
+        ConfigStore.current.macNotification.toggle()
+        ConfigStore.save()
+        if ConfigStore.current.macNotification {
+            requestMacNotificationPermission { granted in
+                if granted {
+                    // Immediate preview so the user sees what to expect.
+                    postMacNotification(title: "ClaudeSound",
+                                        body: "Benachrichtigungen aktiviert.")
+                }
+            }
+        }
+    }
+
     @objc private func toggleOverlay() {
         ConfigStore.current.overlayEnabled.toggle()
         ConfigStore.save()
@@ -1365,8 +1419,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 workingPIDs.remove(pid)
                 refreshOverlay()
             }
+            if cfg.macNotification {
+                // Body: show the session's working folder when we have it,
+                // otherwise leave empty so just the title shows.
+                var body: String? = nil
+                if let pid = pid,
+                   let proc = cachedProcs.first(where: { $0.pid == pid }),
+                   let folder = userlandFolder(proc.cwd) {
+                    body = folder
+                }
+                postMacNotification(title: "Claude ist fertig", body: body)
+            }
         default: break
         }
+    }
+
+    // MARK: UNUserNotificationCenterDelegate
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                willPresent notification: UNNotification,
+                                withCompletionHandler completionHandler:
+                                  @escaping (UNNotificationPresentationOptions) -> Void) {
+        // Show banner even if the app counts as foreground (LSUIElement apps
+        // mostly don't, but be explicit). List entry so it joins the
+        // Notification Center history.
+        completionHandler([.banner, .list])
     }
 }
 
