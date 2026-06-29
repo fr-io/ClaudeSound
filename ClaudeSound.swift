@@ -753,12 +753,14 @@ func requestMacNotificationPermission(_ completion: ((Bool) -> Void)? = nil) {
     }
 }
 
-func postMacNotification(title: String, body: String?) {
+func postMacNotification(title: String, body: String?, pid: Int? = nil) {
     let content = UNMutableNotificationContent()
     content.title = title
     if let body = body, !body.isEmpty { content.body = body }
     // We already play the configured AIFF on `done`; don't double up.
     content.sound = nil
+    // userInfo lets `didReceive` route the click back to the right session.
+    if let pid = pid { content.userInfo = ["pid": pid] }
     let req = UNNotificationRequest(
         identifier: UUID().uuidString,
         content: content,
@@ -1428,7 +1430,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                    let folder = userlandFolder(proc.cwd) {
                     body = folder
                 }
-                postMacNotification(title: "Claude ist fertig", body: body)
+                postMacNotification(title: "Claude ist fertig", body: body, pid: pid)
             }
         default: break
         }
@@ -1444,6 +1446,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         // mostly don't, but be explicit). List entry so it joins the
         // Notification Center history.
         completionHandler([.banner, .list])
+    }
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler:
+                                  @escaping () -> Void) {
+        // Banner / Notification-Center click → focus the originating session.
+        let info = response.notification.request.content.userInfo
+        if let pid = info["pid"] as? Int {
+            focusPID(pid)
+        }
+        completionHandler()
     }
 }
 
