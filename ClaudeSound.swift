@@ -20,6 +20,11 @@ struct Config: Codable {
     var overlayScreenIndex: Int = 0      // index into NSScreen.screens
     var overlayCorner: String = "topRight"   // "topRight" | "topLeft"
     var macNotification: Bool = false        // banner on `done`
+
+    // GitHub build notifications
+    var githubUsername: String? = nil        // authenticated login; also drives the actor filter
+    var githubBuildNotifications: Bool = false
+    var lastSeenRunIDs: [String: Int] = [:]  // "owner/repo" → highest seen run id
 }
 
 enum ConfigStore {
@@ -743,6 +748,115 @@ func shellQuote(_ s: String) -> String {
     "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
+// MARK: - GitHub build polling
+
+/// Locates the `gh` CLI binary. The app inherits a minimal PATH from
+/// launchd, so PATH-based lookup is unreliable — we probe known install
+/// locations directly.
+func ghBinary() -> String? {
+    for p in ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"] {
+        if FileManager.default.isExecutableFile(atPath: p) { return p }
+    }
+    return nil
+}
+
+/// Fetches the current `gh auth token`. Returns nil if gh isn't installed
+/// or no user is logged in.
+func ghAuthToken() -> String? {
+    guard let bin = ghBinary() else { return nil }
+    let out = runCapturingStdout(bin, ["auth", "token"])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return out.isEmpty ? nil : out
+}
+
+/// `gh api user --jq .login` → the authenticated username.
+func ghCurrentUsername() -> String? {
+    guard let bin = ghBinary() else { return nil }
+    let out = runCapturingStdout(bin, ["api", "user", "--jq", ".login"])
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return out.isEmpty ? nil : out
+}
+
+struct WorkflowRun: Decodable {
+    let id: Int
+    let name: String?
+    let status: String
+    let conclusion: String?
+    let htmlURL: String
+    let headBranch: String?
+    enum CodingKeys: String, CodingKey {
+        case id, name, status, conclusion
+        case htmlURL = "html_url"
+        case headBranch = "head_branch"
+    }
+}
+
+struct WorkflowRunsResponse: Decodable {
+    let workflowRuns: [WorkflowRun]
+    enum CodingKeys: String, CodingKey {
+        case workflowRuns = "workflow_runs"
+    }
+}
+
+struct RepoRef: Decodable {
+    let fullName: String
+    enum CodingKeys: String, CodingKey { case fullName = "full_name" }
+}
+
+/// GitHub has no account-wide "runs I triggered" endpoint, so we poll per
+/// repo. This discovers the repos the user is active in — their own plus
+/// ones they collaborate on — most-recently-pushed first, which is where
+/// their actions actually run. Capped so polling stays cheap on the API.
+func fetchUserRepos(token: String, limit: Int,
+                    completion: @escaping ([String]) -> Void) {
+    guard let url = URL(string:
+        "https://api.github.com/user/repos?sort=pushed&per_page=\(limit)&affiliation=owner,collaborator,organization_member")
+    else { completion([]); return }
+    var req = URLRequest(url: url)
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+    req.timeoutInterval = 15
+    URLSession.shared.dataTask(with: req) { data, _, _ in
+        guard let data = data,
+              let repos = try? JSONDecoder().decode([RepoRef].self, from: data)
+        else { completion([]); return }
+        completion(repos.map { $0.fullName })
+    }.resume()
+}
+
+/// Fetches recent workflow runs for `owner/repo`, restricted to those the
+/// given `actor` triggered.
+func fetchWorkflowRuns(repo: String, actor: String, token: String,
+                       completion: @escaping (Result<[WorkflowRun], Error>) -> Void) {
+    let encodedActor = actor.addingPercentEncoding(
+        withAllowedCharacters: .urlQueryAllowed) ?? actor
+    guard let url = URL(string:
+        "https://api.github.com/repos/\(repo)/actions/runs?per_page=10&actor=\(encodedActor)")
+    else {
+        completion(.failure(NSError(domain: "ClaudeSound", code: 1)))
+        return
+    }
+    var req = URLRequest(url: url)
+    req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+    req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+    req.timeoutInterval = 15
+    URLSession.shared.dataTask(with: req) { data, _, err in
+        if let err = err { completion(.failure(err)); return }
+        guard let data = data else {
+            completion(.failure(NSError(domain: "ClaudeSound", code: 2)))
+            return
+        }
+        do {
+            let resp = try JSONDecoder().decode(WorkflowRunsResponse.self, from: data)
+            completion(.success(resp.workflowRuns))
+        } catch {
+            completion(.failure(error))
+        }
+    }.resume()
+}
+
 // MARK: - macOS notification helpers
 
 func requestMacNotificationPermission(_ completion: ((Bool) -> Void)? = nil) {
@@ -795,6 +909,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     private var updateState: UpdateState = .idle
     private var updateTimer: Timer?
 
+    private var buildPollTimer: Timer?
+
     func applicationDidFinishLaunching(_ n: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
@@ -810,6 +926,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         ensureClaudeHooksInstalled()
         startOverlayTimer()
         scheduleUpdateChecks()
+        startBuildPolling()
 
         UNUserNotificationCenter.current().delegate = self
         if ConfigStore.current.macNotification {
@@ -834,6 +951,148 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         updateTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             self?.checkForUpdates()
         }
+    }
+
+    // MARK: GitHub build polling
+
+    private func startBuildPolling() {
+        buildPollTimer?.invalidate()
+        buildPollTimer = nil
+        let cfg = ConfigStore.current
+        guard cfg.githubBuildNotifications,
+              cfg.githubUsername != nil else { return }
+        // First poll 3 s after launch (don't slow startup), then every 90 s.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            self?.pollBuilds()
+        }
+        buildPollTimer = Timer.scheduledTimer(withTimeInterval: 90, repeats: true) { [weak self] _ in
+            self?.pollBuilds()
+        }
+    }
+
+    // Cap on repos polled per cycle. Only repos the user actively pushes to
+    // run their actions, so the most-recently-pushed slice covers them while
+    // keeping the API call count well within the authenticated rate limit.
+    private let buildRepoLimit = 30
+
+    private func pollBuilds() {
+        guard let token = ghAuthToken(),
+              let user = ConfigStore.current.githubUsername else { return }
+        fetchUserRepos(token: token, limit: buildRepoLimit) { [weak self] repos in
+            guard let self = self else { return }
+            for repo in repos {
+                fetchWorkflowRuns(repo: repo, actor: user, token: token) { result in
+                    DispatchQueue.main.async {
+                        guard case .success(let runs) = result else { return }
+                        self.handleRuns(repo: repo, runs: runs)
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleRuns(repo: String, runs: [WorkflowRun]) {
+        let lastSeen = ConfigStore.current.lastSeenRunIDs[repo] ?? -1
+        let maxID = runs.map { $0.id }.max() ?? lastSeen
+
+        if lastSeen == -1 {
+            // First observation — initialize the high-water mark so we don't
+            // notify for historical runs.
+            ConfigStore.current.lastSeenRunIDs[repo] = maxID
+            ConfigStore.save()
+            return
+        }
+        let fresh = runs
+            .filter { $0.id > lastSeen && $0.status == "completed" }
+            .sorted { $0.id < $1.id }
+        for run in fresh {
+            postBuildNotification(repo: repo, run: run)
+        }
+        if maxID > lastSeen {
+            ConfigStore.current.lastSeenRunIDs[repo] = maxID
+            ConfigStore.save()
+        }
+    }
+
+    private func postBuildNotification(repo: String, run: WorkflowRun) {
+        let icon: String
+        switch run.conclusion {
+        case "success":   icon = "✅"
+        case "failure":   icon = "❌"
+        case "cancelled": icon = "⛔️"
+        case "skipped":   icon = "⏭️"
+        case "timed_out": icon = "⏱️"
+        default:          icon = "•"
+        }
+        let title = "\(icon) \(repo)"
+        var bodyParts: [String] = []
+        if let n = run.name, !n.isEmpty { bodyParts.append(n) }
+        if let b = run.headBranch, !b.isEmpty { bodyParts.append(b) }
+        let body = bodyParts.joined(separator: " — ")
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        if !body.isEmpty { content.body = body }
+        content.userInfo = ["openURL": run.htmlURL]
+        let req = UNNotificationRequest(
+            identifier: "build-\(run.id)",
+            content: content,
+            trigger: nil)
+        UNUserNotificationCenter.current().add(req) { err in
+            if let err = err {
+                NSLog("ClaudeSound: build-notif post failed: \(err)")
+            }
+        }
+    }
+
+    // MARK: GitHub account / repos actions
+
+    @objc private func toggleBuildNotifications() {
+        ConfigStore.current.githubBuildNotifications.toggle()
+        ConfigStore.save()
+        if ConfigStore.current.githubBuildNotifications &&
+           ConfigStore.current.macNotification == false {
+            // Build notifications need the same UN permission. Request it
+            // proactively so the very first build banner isn't silently dropped.
+            requestMacNotificationPermission(nil)
+        }
+        startBuildPolling()
+    }
+
+    @objc private func connectGitHubAccount() {
+        guard ghBinary() != nil else {
+            showAlert(title: "gh CLI nicht gefunden",
+                      info: "Installiere die GitHub CLI (z. B. via Homebrew: `brew install gh`) und führe dann `gh auth login` aus. ClaudeSound nutzt diese Auth automatisch.")
+            return
+        }
+        guard ghAuthToken() != nil else {
+            showAlert(title: "Nicht angemeldet",
+                      info: "Bitte `gh auth login` in einem Terminal ausführen, dann hier erneut 'Account verbinden' klicken.")
+            return
+        }
+        guard let user = ghCurrentUsername() else {
+            showAlert(title: "GitHub-API antwortet nicht",
+                      info: "`gh api user` schlug fehl. Token abgelaufen?")
+            return
+        }
+        ConfigStore.current.githubUsername = user
+        ConfigStore.save()
+        startBuildPolling()
+    }
+
+    @objc private func disconnectGitHubAccount() {
+        ConfigStore.current.githubUsername = nil
+        ConfigStore.current.githubBuildNotifications = false
+        ConfigStore.current.lastSeenRunIDs = [:]
+        ConfigStore.save()
+        startBuildPolling()
+    }
+
+    private func showAlert(title: String, info: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = info
+        a.runModal()
     }
 
     @objc private func checkForUpdates() {
@@ -1176,6 +1435,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         macNotif.target = self
         m.addItem(macNotif)
 
+        addGitHubSection(to: m)
+
         let ovr = NSMenuItem(title: "Sitzungs-Overlay (Zahnräder)",
                              action: #selector(toggleOverlay), keyEquivalent: "")
         ovr.state = ConfigStore.current.overlayEnabled ? .on : .off
@@ -1279,6 +1540,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             sub.addItem(it)
         }
         return sub
+    }
+
+    private func addGitHubSection(to m: NSMenu) {
+        m.addItem(.separator())
+        let header = NSMenuItem(title: "GitHub-Builds",
+                                action: nil, keyEquivalent: "")
+        header.isEnabled = false
+        m.addItem(header)
+
+        if let user = ConfigStore.current.githubUsername {
+            let acc = NSMenuItem(title: "Account: @\(user) (trennen)",
+                                 action: #selector(disconnectGitHubAccount),
+                                 keyEquivalent: "")
+            acc.target = self
+            m.addItem(acc)
+
+            let toggle = NSMenuItem(title: "Build-Benachrichtigungen",
+                                    action: #selector(toggleBuildNotifications),
+                                    keyEquivalent: "")
+            toggle.state = ConfigStore.current.githubBuildNotifications ? .on : .off
+            toggle.target = self
+            m.addItem(toggle)
+
+            if ConfigStore.current.githubBuildNotifications {
+                let hint = NSMenuItem(
+                    title: "Meldet Actions, die @\(user) gestartet hat",
+                    action: nil, keyEquivalent: "")
+                hint.isEnabled = false
+                m.addItem(hint)
+            }
+        } else {
+            let acc = NSMenuItem(title: "Account verbinden…",
+                                 action: #selector(connectGitHubAccount),
+                                 keyEquivalent: "")
+            acc.target = self
+            m.addItem(acc)
+        }
     }
 
     private func buildScreenSubmenu() -> NSMenu {
@@ -1452,10 +1750,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
                                 didReceive response: UNNotificationResponse,
                                 withCompletionHandler completionHandler:
                                   @escaping () -> Void) {
-        // Banner / Notification-Center click → focus the originating session.
+        // Banner / Notification-Center click → either focus the originating
+        // session (done-events) or open the URL (build-events).
         let info = response.notification.request.content.userInfo
         if let pid = info["pid"] as? Int {
             focusPID(pid)
+        } else if let urlStr = info["openURL"] as? String,
+                  let url = URL(string: urlStr) {
+            NSWorkspace.shared.open(url)
         }
         completionHandler()
     }
